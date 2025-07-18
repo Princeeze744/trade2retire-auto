@@ -4,93 +4,120 @@ const bodyParser = require('body-parser');
 const Twilio = require('twilio');
 const app = express();
 
-// Middleware with increased limits
+// Middleware
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 app.use(bodyParser.json({ limit: '10mb' }));
 
-// Detailed logging
+// Log startup info
 console.log("🚀 Trade2Retire Automation Starting...");
 console.log("Twilio SID:", process.env.TWILIO_SID ? "****" + process.env.TWILIO_SID.slice(-4) : "MISSING");
 console.log("Twilio Number:", process.env.TWILIO_NUMBER);
 console.log("Group Link:", process.env.WHATSAPP_GROUP_LINK);
+console.log("Sandbox Code:", process.env.SANDBOX_CODE);
 
-// Twilio client with error handling
-let twilioClient;
-try {
-  twilioClient = new Twilio(
-    process.env.TWILIO_SID, 
-    process.env.TWILIO_TOKEN
-  );
-  console.log("✅ Twilio client initialized");
-} catch (error) {
-  console.error("❌ Twilio initialization failed:", error.message);
-  process.exit(1);
-}
+// Twilio client
+const twilioClient = new Twilio(
+  process.env.TWILIO_SID, 
+  process.env.TWILIO_TOKEN
+);
 
-// Automatic response function
-const autoRespond = async (fromPhone) => {
+// User state tracking
+const userStates = {};
+
+// Send message helper
+const sendMessage = async (to, body) => {
   try {
-    // Format phone number
-    let formattedPhone = fromPhone;
-    if (!fromPhone.startsWith('whatsapp:')) {
-      formattedPhone = `whatsapp:${fromPhone}`;
-    }
+    const formattedTo = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
     
-    // Create message
-    const message = `🎉 Payment verified!\nJoin Trade2Retire group:\n${process.env.WHATSAPP_GROUP_LINK}`;
-    
-    // Send message
     await twilioClient.messages.create({
-      body: message,
+      body: body,
       from: `whatsapp:${process.env.TWILIO_NUMBER}`,
-      to: formattedPhone
+      to: formattedTo
     });
     
-    console.log(`✅ Group invite sent to ${formattedPhone}`);
+    console.log(`✅ Message sent to ${formattedTo}`);
     return true;
   } catch (error) {
-    console.error('🚨 Response error:', error.message);
-    console.error('Twilio error code:', error.code);
+    console.error('🚨 Message failed:', error.message);
     return false;
   }
+};
+
+// Process new users
+const handleNewUser = async (from) => {
+  // Store user state
+  userStates[from] = 'awaiting_activation';
+  
+  // Send activation instructions
+  await sendMessage(
+    from,
+    `📲 *Trade2Retire Activation Required*\n\n` +
+    `To continue, please activate our WhatsApp service:\n` +
+    `1. Reply with this code: ${process.env.SANDBOX_CODE}\n` +
+    `2. Then resend your payment screenshot\n\n` +
+    `_This is required for security verification_`
+  );
+  
+  // Notify admin
+  await sendMessage(
+    process.env.BUSINESS_PHONE,
+    `🆕 New student activation required:\n` +
+    `From: ${from}\n` +
+    `Please guide them to send: ${process.env.SANDBOX_CODE}`
+  );
+};
+
+// Process payment screenshot
+const processPayment = async (from) => {
+  // Send group invite
+  await sendMessage(
+    from,
+    `🎉 *Payment Verified!*\n\n` +
+    `Welcome to Trade2Retire! Join our group:\n` +
+    `${process.env.WHATSAPP_GROUP_LINK}\n\n` +
+    `See you inside! 👋`
+  );
+  
+  // Update user state
+  userStates[from] = 'active';
+  
+  console.log(`💰 Payment processed for ${from}`);
 };
 
 // WhatsApp webhook handler
 app.post('/webhook', async (req, res) => {
   try {
-    console.log("\n=== NEW WEBHOOK REQUEST ===");
-    console.log("Headers:", req.headers);
-    console.log("Body:", req.body);
-    
     const from = req.body.From;
-    const body = req.body.Body || '';
+    const body = (req.body.Body || '').trim().toLowerCase();
     const mediaCount = parseInt(req.body.NumMedia) || 0;
     
-    if (!from) {
-      console.log("⚠️ Missing 'From' in request");
-      return res.status(400).send("Missing From parameter");
+    console.log(`📩 Incoming from ${from}: ${body.substring(0, 50)}`);
+
+    // New user activation flow
+    if (body === process.env.SANDBOX_CODE.toLowerCase()) {
+      userStates[from] = 'activated';
+      await sendMessage(
+        from,
+        `✅ *Activation Successful!*\n\n` +
+        `You can now send payment screenshots\n` +
+        `to join Trade2Retire group immediately.`
+      );
+      return res.status(200).send('OK');
     }
     
-    console.log(`📩 Incoming message from ${from}: ${body.substring(0, 50)}...`);
-    console.log(`🖼️ Media count: ${mediaCount}`);
-    
-    // Check if message contains media
+    // Handle payment screenshot
     if (mediaCount > 0) {
-      console.log(`🖼️ Payment screenshot detected from ${from}`);
-      const success = await autoRespond(from);
-      
-      if (success) {
-        console.log("✅ Successfully processed payment screenshot");
-      } else {
-        console.log("❌ Failed to process payment screenshot");
+      // Check user status
+      if (!userStates[from] || userStates[from] === 'awaiting_activation') {
+        await handleNewUser(from);
+      } else if (userStates[from] === 'activated' || userStates[from] === 'active') {
+        await processPayment(from);
       }
-    } else {
-      console.log("ℹ️ No media found - ignoring message");
     }
     
     res.status(200).send('OK');
   } catch (error) {
-    console.error('🚨 Webhook processing error:', error);
+    console.error('🚨 Webhook error:', error);
     res.status(500).send('Server error');
   }
 });
@@ -102,26 +129,12 @@ app.get('/', (req, res) => {
     <p>Status: <span style="color:green">RUNNING</span></p>
     <p>Twilio Number: ${process.env.TWILIO_NUMBER}</p>
     <p>Group Link: <a href="${process.env.WHATSAPP_GROUP_LINK}">Join Group</a></p>
-    <h3>Last 10 Logs:</h3>
-    <pre>${getRecentLogs()}</pre>
+    <p>Sandbox Code: ${process.env.SANDBOX_CODE}</p>
   `);
-});
-
-// Simple log storage for web display
-const logs = [];
-const getRecentLogs = () => logs.slice(-10).join('\n');
-
-// Log all requests for debugging
-app.use((req, res, next) => {
-  const logEntry = `[${new Date().toISOString()}] ${req.method} ${req.url}`;
-  console.log(logEntry);
-  logs.push(logEntry);
-  next();
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`👉 Health check: http://localhost:${PORT}/`);
 });
